@@ -15,7 +15,7 @@ TARGET_TOK = int(os.environ.get("TARGET_TOK", "200000"))
 
 rnd = random.Random(time.time_ns())
 words = ["ledger", "harbor", "quartz", "meadow", "signal", "copper", "falcon", "orbit",
-         "timber", "velvet", "cinder", "prism", "tundra", "marble", "saddle", "lantern"]
+         "timber", "velvet", "cinder", "basalt", "tundra", "marble", "saddle", "lantern"]
 n_words = int(TARGET_TOK / 1.3)  # about 1.3 tokens per word for this filler
 body = " ".join(rnd.choice(words) + (str(rnd.randint(0, 999)) if rnd.random() < 0.2 else "") for _ in range(n_words))
 needle = f"The secret code word is NIGHTJAR-{rnd.randint(1000, 9999)}."
