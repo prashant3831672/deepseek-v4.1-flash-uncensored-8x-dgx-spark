@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# Launch DeepSeek Harness (dsh, a local source checkout) against a local vLLM cluster.
+# Cluster preflight -> rebuild whatever the last `git pull` invalidated -> start the web UI.
+#
+#   dsh-spark                      preflight -> auto-build if stale -> web UI on :3080
+#   DSH_NO_AUTOBUILD=1 dsh-spark   warn about staleness but do not build
+#   DSH_FROM_SOURCE=1  dsh-spark   run TS source via tsx (never stale, slower start)
+#   DSH_WORKSPACE=/x   dsh-spark   different workspace root (default: the current directory)
+#   DSH_REPO=/x        dsh-spark   different clone (default: ~/src/deepseek-harness)
+#   SPARK_URL=http://host:8888     override the preflight address (dsh itself uses ~/.dsh/settings.yaml)
+#   SPARK_API_KEY=...              only if your cluster runs vLLM with --api-key
+set -euo pipefail
+
+# --- undici transport timeouts (local-LLM long prefill) ----------------------
+# undici defaults headersTimeout AND bodyTimeout to 300_000 ms. vLLM emits no
+# response bytes until generation starts, and generation starts only after the
+# whole prompt is prefilled -- so any cold turn whose prefill exceeds 5 min is
+# killed client-side as a bare `terminated` (code: TRANSPORT) while the server
+# completes it and logs HTTP 200. The provider's timeoutMs/streamIdleTimeoutMs
+# are application-level and never reach undici. Verified: with this shim a
+# request survives 310 s of silence; without it, it dies at 300 s.
+_UNDICI_SHIM="$HOME/.local/lib/undici-longtimeout.mjs"
+if [ -f "$_UNDICI_SHIM" ]; then
+  export NODE_OPTIONS="--import $_UNDICI_SHIM ${NODE_OPTIONS:-}"
+fi
+
+CLUSTER="${SPARK_URL:-http://__SPARK_HOST__:8888}"
+MODEL="${SPARK_MODEL:-__SERVED_MODEL__}"
+REPO="${DSH_REPO:-$HOME/src/deepseek-harness}"
+# Workspace = the directory you invoke from (dsh's own contract). dsh namespaces
+# sessions per workspace path (~/.dsh/sessions/--path--), so FORCING a workspace
+# silently moves you into a different chat history. Only DSH_WORKSPACE overrides.
+WORKSPACE="${DSH_WORKSPACE:-$PWD}"
+BUILDLOG="${TMPDIR:-/tmp}/dsh-spark-build.log"
+
+# pi-ai requires a key reference for a hand-declared route even when the server
+# has no auth; the dummy below satisfies that. Export a real SPARK_API_KEY if
+# your vLLM runs with --api-key.
+export SPARK_API_KEY="${SPARK_API_KEY:-spark-local-noauth}"
+
+printf 'checking cluster ... '
+_auth=(-H "Authorization: Bearer $SPARK_API_KEY")
+if ! curl -fsS -m 8 "${_auth[@]}" "$CLUSTER/v1/models" >/dev/null 2>&1; then
+  _code=$(curl -s -o /dev/null -m 8 "${_auth[@]}" -w "%{http_code}" "$CLUSTER/v1/models" 2>/dev/null)
+  if [ "$_code" = "401" ] || [ "$_code" = "403" ]; then
+    echo "AUTH FAILED (HTTP $_code) at $CLUSTER"
+    echo "  the server requires a key: export SPARK_API_KEY=<key> and re-run"
+    exit 1
+  fi
+  echo "UNREACHABLE at $CLUSTER"
+  echo "  - is this laptop on a network that reaches the head node's :8888?"
+  echo "  - remote: use a private overlay network and re-run with SPARK_URL=http://<overlay-ip>:8888"
+  exit 1
+fi
+served=$(curl -fsS -m 8 "${_auth[@]}" "$CLUSTER/v1/models" | python3 -c 'import sys,json;print(json.load(sys.stdin)["data"][0]["id"])')
+echo "ok - serving: $served"
+[ "$served" = "$MODEL" ] || echo "  NOTE: served model ($served) != expected ($MODEL) - check ~/.dsh/settings.yaml"
+
+[ -d "$REPO" ] || { echo "dsh clone missing: $REPO (set DSH_REPO or run install.sh)"; exit 1; }
+
+BUILT="$REPO/apps/cli/lib/bin.js"
+SRCBIN="$REPO/apps/cli/src/bin.ts"
+WEBREF="$REPO/apps/web/dist/index.html"
+MODREF="$REPO/node_modules/.modules.yaml"
+
+if command -v git >/dev/null && git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1; then
+  behind=$(git -C "$REPO" rev-list --count HEAD..@{u} 2>/dev/null || echo 0)
+  dirty=$(git -C "$REPO" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  echo "repo: $(git -C "$REPO" rev-parse --short HEAD) on $(git -C "$REPO" rev-parse --abbrev-ref HEAD) | behind ${behind} | ${dirty} local change(s)"
+  [ "${behind:-0}" -gt 0 ] && echo "  (newer commits upstream: git -C $REPO pull)"
+fi
+
+# tsx source mode needs no build at all
+if [ "${DSH_FROM_SOURCE:-0}" = "1" ]; then
+  [ -f "$SRCBIN" ] || { echo "source entrypoint missing: $SRCBIN"; exit 1; }
+  cd "$WORKSPACE" || { echo "workspace missing: $WORKSPACE"; exit 1; }
+  echo "dsh: from SOURCE via tsx   workspace: $WORKSPACE"
+  if [ "$#" -eq 0 ]; then exec node --import tsx/esm "$SRCBIN" --profile web --port 3080
+  else exec node --import tsx/esm "$SRCBIN" "$@"; fi
+fi
+
+# ---- staleness detection (short-circuits on first hit; ~0.05s) ----
+newer_than() {  # newer_than <reference-file> <dir>...   -> prints a path if anything is newer
+  local ref="$1"; shift
+  [ -f "$ref" ] || { echo "MISSING"; return; }
+  find "$@" \( -name '*.ts' -o -name '*.tsx' -o -name '*.vue' \) \
+       -not -path '*/node_modules/*' -newer "$ref" -print -quit 2>/dev/null
+}
+
+deps_stale=0
+[ -f "$REPO/pnpm-lock.yaml" ] && [ -f "$MODREF" ] && [ "$REPO/pnpm-lock.yaml" -nt "$MODREF" ] && deps_stale=1
+lib_stale=$(newer_than "$BUILT"  "$REPO/apps/cli/src" "$REPO/packages")
+web_stale=$(newer_than "$WEBREF" "$REPO/apps/web/src" "$REPO/packages/client")
+
+if [ "$deps_stale" = "1" ] || [ -n "$lib_stale" ] || [ -n "$web_stale" ]; then
+  if [ "${DSH_NO_AUTOBUILD:-0}" = "1" ]; then
+    echo "  !! STALE (autobuild disabled):"
+    [ "$deps_stale" = "1" ] && echo "     deps  - pnpm-lock.yaml newer than node_modules"
+    [ -n "$lib_stale" ]     && echo "     lib   - ${lib_stale#$REPO/}"
+    [ -n "$web_stale" ]     && echo "     web   - ${web_stale#$REPO/}"
+    echo "     fix:  pnpm -C $REPO install && pnpm -C $REPO build:lib && pnpm -C $REPO build:web"
+  else
+    run_step() {  # run_step <label> <pnpm-args...>
+      printf '  building %-6s ... ' "$1"; local label="$1"; shift
+      if (cd "$REPO" && pnpm "$@" ) >"$BUILDLOG" 2>&1; then
+        echo "ok"
+      else
+        echo "FAILED"
+        echo "  --- last 25 lines of $BUILDLOG ---"
+        tail -25 "$BUILDLOG" | sed 's/^/  /'
+        echo "  refusing to start on a broken build."
+        echo "  (retry manually, or run live source: DSH_FROM_SOURCE=1 dsh-spark)"
+        exit 1
+      fi
+    }
+    [ "$deps_stale" = "1" ] && run_step deps install --prefer-offline
+    # client packages feed the web bundle, so a lib rebuild always re-bundles web too.
+    if [ -n "$lib_stale" ]; then
+      run_step lib build:lib
+      run_step web build:web
+    elif [ -n "$web_stale" ]; then
+      run_step web build:web
+    fi
+  fi
+fi
+
+# dsh >= 0.1.5 needs a native flock addon that a source checkout does not ship prebuilt
+# ("Cannot find module .../native/system/packages/darwin-arm64/bin/system.node" on every resume).
+NATIVE="$REPO/native/system/packages/darwin-arm64/bin/system.node"
+if [ -d "$REPO/native/system" ] && [ ! -f "$NATIVE" ]; then
+  printf '  building native ... '
+  if (cd "$REPO" && pnpm build:native-system) >"$BUILDLOG" 2>&1; then echo ok; else echo "FAILED (see $BUILDLOG)"; exit 1; fi
+fi
+[ -f "$BUILT" ] || { echo "no build at $BUILT - run: pnpm -C $REPO build:lib"; exit 1; }
+cd "$WORKSPACE" || { echo "workspace missing: $WORKSPACE"; exit 1; }
+
+ver=$(node -e "try{console.log(require('$REPO/apps/cli/package.json').version)}catch(e){console.log('?')}" 2>/dev/null || echo '?')
+echo "dsh: $ver (built)  workspace: $WORKSPACE"
+if [ "$#" -eq 0 ]; then exec node "$BUILT" --profile web --port 3080
+else exec node "$BUILT" "$@"; fi

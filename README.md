@@ -61,6 +61,8 @@ The fallback job (what `tools/safety_net.sh` relaunches and `tools/stop_all.sh -
 | tools/fanout_image.sh | docker save on the build node, HTTP over the fabric, docker load on the other 7 |
 | tools/gpu_burn_check.sh | 15 s fp16 burn on all 8: catches a clock-latched GB10 before it costs a boot |
 | tools/wait_ready.sh | poll the head until /v1/models answers; prints KV pool and concurrency lines |
+| client/ | DeepSeek Harness (dsh) client kit for a Mac: installer, settings, launcher, the undici timeout shim; see client/README.md |
+| bench/fairness/ | what other sessions get during a long cold prefill: bigprefill.py + probe_during.py, with the numbers behind the long-prefill threshold |
 | tools/status.sh | one line per node: MemAvailable, containers, shards on disk, image id |
 | tools/safety_net.sh | if V4.1 is not healthy, relaunch the GLM 512K job (for 05:30 on the decision night) |
 
@@ -165,11 +167,22 @@ hand-declared provider that reuses that id; giving the uncensored build its own 
 - After boot A, one per boot: EP=1 (EP8 gives each rank 48 whole experts; try if the MoE at 2304/8 trips or decode is
   below estimate), SEQS 12-16, MAX_BATCHED 16384 for prefill, head-node host headroom under 4 sessions.
 
+## Client kit and fairness probes (added 2026-09-17)
+
+- **client/**: everything needed to point the DeepSeek Harness coding agent at this cluster from a
+  Mac, and the four failures it fixes: the hand-declared provider `compat` overrides vLLM needs, the
+  two 5-minute timeout layers (application and Node transport) that kill any cold prefill over about
+  390K tokens, the valueless `"off":` reasoning key, and the native addon a source checkout must build.
+  `client/README.md` has the reasoning; `client/install.sh --spark-host <head>` does the work.
+- **bench/fairness/**: `bigprefill.py` plus `probe_during.py` measure what a short request gets while
+  a 200K cold prompt prefills on the same engine. Untreated: 0.1 to 1 tok/s and 4 to 10 s steps. With
+  `--long-prefill-token-threshold 2048`: 2.9 to 4.3 tok/s at a 10% prefill cost. The README there
+  explains the starvation signature and why it looks like a hang from the metrics side.
+
 ## Still to add
 
-The per-boot profile lines for boots A and B, host headroom under four concurrent coding sessions, and the client-side
-setup for running a coding harness against the cluster from another machine. Everything else promised here before the
-first boot is in the Measured table above.
+The per-boot profile lines for boots A and B, and host headroom under four concurrent coding sessions. Everything else
+promised here before the first boot is in the Measured table above; the client setup is in client/.
 
 ## Credits
 

@@ -1,0 +1,71 @@
+# ~/.dsh/settings.yaml for DeepSeek Harness (dsh) against a local vLLM cluster.
+# install.sh substitutes __SPARK_HOST__ and __SERVED_MODEL__.
+#
+# Two lanes side by side; dsh ships two adapters for exactly this case:
+#   deepseek-official  -> api.deepseek.com (web_search works only here: DeepSeek runs
+#                         search server-side, so a local model can never provide it)
+#   spark              -> the local cluster (private, no web_search)
+# Pick per session in the model selector. Delete the first lane if you do not use it.
+
+# --- Lane 1: official API (default endpoint, needs DEEPSEEK_API_KEY in the environment) ---
+llm-deepseek:
+  apiKeyEnv: DEEPSEEK_API_KEY
+  reasoningEffort: max
+  # baseURL intentionally omitted -> defaults to https://api.deepseek.com
+
+# --- Lane 2: the local cluster (hand-declared route, unauthenticated vLLM) ---
+llm-pi-ai:
+  providers:
+    spark:
+      displayName: Spark cluster (DeepSeek-V4.1-Flash, vLLM)
+      api: openai-completions
+      # vLLM binds 0.0.0.0:8888 on the head node; the laptop must reach it directly
+      # (same LAN or a private overlay). Never port-forward it.
+      baseURL: http://__SPARK_HOST__:8888/v1
+      # The cluster has no auth, but pi-ai still requires a key reference for a
+      # HAND-DECLARED route (omitting it => "No API key for provider: spark").
+      # Use a dedicated dummy variable so a real DEEPSEEK_API_KEY stays reserved
+      # for the official lane. The launcher exports SPARK_API_KEY=spark-local-noauth.
+      apiKeyEnv: SPARK_API_KEY
+      compat:
+        # pi-ai cannot recognise a private URL and would otherwise address it
+        # as OpenAI itself (developer role + max_completion_tokens + bare
+        # reasoning_effort), which vLLM's DeepSeek-V4.1 template rejects.
+        thinkingFormat: deepseek
+        supportsDeveloperRole: false
+        maxTokensField: max_tokens
+      # Prefill holds the HTTP stream OPEN but SILENT (no tokens until it finishes).
+      # The 300000 ms (5 min) streamIdleTimeoutMs default killed every large prompt
+      # mid-prefill, then retried five times, and the concurrent retries are what
+      # collapsed throughput. A 1M-context prefill needs about 18 min; allow 60.
+      # These are application-level timeouts; the transport-level 300 s cap is a
+      # separate problem solved by undici-longtimeout.mjs.
+      timeoutMs: 3600000
+      streamIdleTimeoutMs: 3600000
+      models:
+        - id: __SERVED_MODEL__
+          name: DeepSeek-V4.1-Flash on the Spark cluster (vLLM, DSpark k=5, 1M ctx)
+          # vLLM --max-model-len 1048576; leave room for maxTokens plus template overhead.
+          contextWindow: 1015808
+          maxTokens: 16384
+          # V4.1: thinking is OFF unless a reasoning_effort is sent (server default
+          # thinking=false). A top-level reasoning_effort turns it on; tiers are
+          # low/high/xhigh/max. So "off" maps to an EMPTY value (param omitted =>
+          # no thinking). The key must be VALUELESS: an empty string silently
+          # invalidates the whole provider and it vanishes from the picker.
+          reasoningEfforts:
+            "off":
+            low: low
+            high: high
+            max: max
+agent-default-model:
+  provider: spark
+  model: __SERVED_MODEL__
+  reasoningEffort: high
+ui-conversation:
+  busyEnter: steer
+subagent-model-selection:
+  enabled: true
+  allowedModels:
+    - provider: spark
+      model: __SERVED_MODEL__
